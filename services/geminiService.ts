@@ -3,7 +3,7 @@ import { VideoMetadata } from "../types";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// Using gemini-3-flash-preview for efficiency in high-volume processing tasks.
+// Using gemini-3-flash-preview for efficiency and large context window.
 const MODEL_NAME = 'gemini-3-flash-preview';
 
 interface AnalysisResult {
@@ -69,9 +69,9 @@ export const analyzeExternalVideo = async (url: string): Promise<AnalysisResult>
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-3-pro-preview',
-      contents: `Analyze the following video URL: "${url}"
-      Use 'googleSearch' to find the video title, description, transcript, and a content summary.
-      Include social metadata (likes, views, creator) if visible in search results.
+      contents: `Deeply analyze the video URL: "${url}"
+      Use 'googleSearch' to find title, description, and content details.
+      Provide a "transcription" which is a detailed scene-by-scene description or transcript.
       Return JSON: {title, transcription, summary, keywords}`,
       config: {
         tools: [{ googleSearch: {} }],
@@ -101,9 +101,18 @@ export const analyzeExternalVideo = async (url: string): Promise<AnalysisResult>
 export const analyzeWebContent = async (htmlContent: string, instruction: string, url: string): Promise<AnalysisResult> => {
   try {
     const prompt = `
-      You are an expert web scraper. Context URL: ${url}. Extraction Goal: ${instruction || "General summary"}.
-      Content: ${htmlContent.substring(0, 50000)} 
-      Return JSON: {title, transcription, summary, scrapedData, keywords}
+      Expert web content analyst. URL: ${url}. 
+      Extraction Instruction: ${instruction || "Provide a full-text transcription and a detailed technical summary."}.
+      
+      CONTENT TO ANALYZE:
+      ${htmlContent.substring(0, 100000)} 
+      
+      Return JSON with:
+      - title: The page title.
+      - transcription: THE FULL TEXT CONTENT of the page (articles, body, details). 
+      - summary: A concise 2-sentence overview.
+      - keywords: List of 5-8 relevant tags.
+      - scrapedData: Specific technical data or key points.
     `;
 
     const response = await ai.models.generateContent({
@@ -134,17 +143,16 @@ export const analyzeWebContent = async (htmlContent: string, instruction: string
   }
 };
 
-/**
- * Stage 1 Discovery: High-accuracy search for sub-pages.
- */
 export const discoverSiteLinks = async (domainUrl: string): Promise<DiscoveredLink[]> => {
   try {
+    const cleanDomain = domainUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0];
+    
     const response = await ai.models.generateContent({
       model: 'gemini-3-pro-preview',
-      contents: `Perform a deep search for sub-pages of the domain "${domainUrl}".
-      Queries: "site:${domainUrl}", "${domainUrl} articles", "${domainUrl} index", "${domainUrl} documentation".
-      Aim to find at least 15-20 deep content pages (guides, blog posts, feature pages).
-      Exclude utility pages like login, signup, privacy, or legal terms.
+      contents: `Perform a deep audit of "${cleanDomain}". 
+      I need at least 50+ deep content URLs (blog posts, individual prompt pages, articles). 
+      Look for deep nesting and pagination like /prompts/1, /prompts/page/2, etc. 
+      Search Queries: "site:${cleanDomain} inurl:prompts", "site:${cleanDomain} sitemap", "${cleanDomain} deep index".
       Return JSON: { "links": [ {"url": "...", "title": "..."}, ... ] }`,
       config: {
         tools: [{ googleSearch: {} }],
@@ -169,26 +177,42 @@ export const discoverSiteLinks = async (domainUrl: string): Promise<DiscoveredLi
       }
     });
 
-    const text = response.text;
-    if (!text) throw new Error("No response from Gemini");
-    const json = JSON.parse(text);
-    return json.links || [];
+    let links: DiscoveredLink[] = [];
+    try {
+        const json = JSON.parse(response.text || '{}');
+        if (json.links) links = json.links;
+    } catch (e) {}
+
+    const metadata = response.candidates?.[0]?.groundingMetadata;
+    const chunks = metadata?.groundingChunks || [];
+    chunks.forEach((chunk: any) => {
+        const uri = chunk.web?.uri;
+        if (uri && (uri.includes(cleanDomain))) {
+            if (!links.some(l => l.url === uri)) {
+                links.push({ url: uri, title: chunk.web.title || uri });
+            }
+        }
+    });
+
+    const seen = new Set();
+    return links.filter(l => {
+        const url = l.url.split('#')[0].split('?')[0];
+        const isNew = !seen.has(url);
+        seen.add(url);
+        return isNew;
+    });
   } catch (error) {
-    console.error("Error in Search Discovery:", error);
+    console.error("Discovery error:", error);
     return [];
   }
 }
 
-/**
- * Phase 3: Hallucinate/Predict links if direct methods fail.
- */
 export const predictCommonLinks = async (baseUrl: string): Promise<DiscoveredLink[]> => {
   try {
+    const cleanBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     const response = await ai.models.generateContent({
       model: MODEL_NAME,
-      contents: `The website at "${baseUrl}" is currently blocking automated crawlers.
-      Based on the domain name and typical website patterns, predict the 10 most likely URLs for content pages (e.g., /blog, /docs, /about, /features, /news).
-      Generate absolute URLs based on ${baseUrl}.
+      contents: `Predict 25 deep content URLs for site "${cleanBase}". Focus on /prompts, /blog, /articles, /documentation.
       Return JSON: { "links": [ {"url": "...", "title": "..."}, ... ] }`,
       config: {
         responseMimeType: "application/json",
@@ -211,28 +235,20 @@ export const predictCommonLinks = async (baseUrl: string): Promise<DiscoveredLin
         }
       }
     });
-
-    const text = response.text;
-    return text ? JSON.parse(text).links : [];
-  } catch {
-    return [];
-  }
+    return JSON.parse(response.text || '{}').links || [];
+  } catch { return []; }
 };
 
-/**
- * Intelligent Filter: Filters a raw list of strings/URLs into a structured discovery list.
- */
 export const filterAndTitleLinks = async (links: string[], baseUrl: string): Promise<DiscoveredLink[]> => {
   try {
     const prompt = `
-      Clean and select the 15 most important content URLs from this raw list found on "${baseUrl}".
-      Ignore: external sites, social media, small UI fragments (#), login, signup, or legal.
-      Target: Articles, Documentation, Blog posts, Guides.
+      Select the 40 most content-heavy pages from this list for "${baseUrl}". 
+      Ignore simple layout fragments and social links.
       
-      URLs:
+      LIST:
       ${links.join('\n')}
       
-      Return JSON: { "links": [ {"url": "...", "title": "A short descriptive title for this page"}, ... ] }
+      Return JSON: { "links": [ {"url": "...", "title": "..."}, ... ] }
     `;
 
     const response = await ai.models.generateContent({
@@ -259,46 +275,23 @@ export const filterAndTitleLinks = async (links: string[], baseUrl: string): Pro
         }
       }
     });
-
-    const text = response.text;
-    if (!text) throw new Error("No response from Gemini");
-    const json = JSON.parse(text);
-    return json.links || [];
-  } catch (error) {
-    console.error("Error filtering links:", error);
-    return [];
-  }
+    return JSON.parse(response.text || '{}').links || [];
+  } catch (error) { return []; }
 };
 
 export const askGlobalQuestion = async (query: string, videos: VideoMetadata[]) => {
-  const context = videos.map(v => `
-    Title: ${v.title}
-    Summary: ${v.summary}
-    Content Snippet: ${v.transcription.substring(0, 500)}...
-  `).join('\n---\n');
-
-  const prompt = `Answer this question based on the library context: "${query}"\n\nContext:\n${context}`;
-
+  const context = videos.map(v => `Title: ${v.title}\nSummary: ${v.summary}\nContent: ${v.transcription.substring(0, 500)}`).join('\n---\n');
+  const prompt = `Answer based on Knowledge Base: "${query}"\n\nContext:\n${context}`;
   try {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: prompt,
-    });
+    const response = await ai.models.generateContent({ model: MODEL_NAME, contents: prompt });
     return response.text;
-  } catch (error) {
-    return "Error searching library context.";
-  }
+  } catch { return "Query failed."; }
 };
 
 export const askVideoQuestion = async (query: string, video: VideoMetadata, fullTranscript: string) => {
     const prompt = `Analyze item "${video.title}". Content: ${fullTranscript}. Question: ${query}`;
     try {
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: prompt,
-      });
+      const response = await ai.models.generateContent({ model: MODEL_NAME, contents: prompt });
       return response.text;
-    } catch (error) {
-      return "Error processing query.";
-    }
-  };
+    } catch { return "Node-specific search failed."; }
+};
