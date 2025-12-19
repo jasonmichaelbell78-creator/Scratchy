@@ -1,0 +1,5 @@
+{
+  "name": "Scratchy",
+  "description": "An intelligent video library that ingests, transcribes, and indexes your videos for semantic search and Q&A using Gemini.",
+  "requestFramePermissions": []
+}
